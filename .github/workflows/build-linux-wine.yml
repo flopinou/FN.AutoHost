@@ -1,3 +1,133 @@
+name: Build Ero 12.41 Wine Diagnostics
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      # =========================================================
+      # CHECKOUT
+      # =========================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # =========================================================
+      # EXTRACT SDK.zip
+      # =========================================================
+      - name: Extract and normalize SDK
+        shell: powershell
+        run: |
+          $zip = "Ero gameserver/SDK.zip"
+          $tmp = "$env:RUNNER_TEMP\EroSDK"
+          $dst = "Ero gameserver/SDK"
+
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Path $tmp | Out-Null
+          New-Item -ItemType Directory -Path $dst | Out-Null
+
+          Expand-Archive -Path $zip -DestinationPath $tmp -Force
+
+          Write-Host "=== Recherche de Basic.hpp ==="
+
+          $basic = Get-ChildItem $tmp -Recurse -Filter "Basic.hpp" |
+                   Select-Object -First 1
+
+          if (-not $basic) {
+              throw "Basic.hpp introuvable dans SDK.zip"
+          }
+
+          $sdkSource = $basic.Directory.FullName
+
+          Write-Host "SDK trouve dans : $sdkSource"
+
+          Copy-Item "$sdkSource\*" $dst -Recurse -Force
+
+          if (-not (Test-Path "$dst\Basic.hpp")) {
+              throw "SDK/Basic.hpp absent"
+          }
+
+          if (-not (Test-Path "$dst\Basic.cpp")) {
+              throw "SDK/Basic.cpp absent"
+          }
+
+          Write-Host "=== SDK OK ==="
+
+      # =========================================================
+      # FIX ORIGINAL INCOMPLETE ERO SOURCE
+      #
+      # - SessionName missing
+      # - PickUpAction defined later in Pawn.h but used first
+      #   in misc.h -> forward declaration
+      # =========================================================
+      - name: Patch incomplete Ero source
+        shell: powershell
+        run: |
+          $file = "Ero gameserver/misc.h"
+          $content = Get-Content $file -Raw
+
+          # -------------------------------------------------------
+          # Disable broken Eon session cleanup
+          # -------------------------------------------------------
+          $oldSession = 'EonApi::RemoveSession(Region, SessionName);'
+
+          if ($content.Contains($oldSession)) {
+              $content = $content.Replace(
+                  $oldSession,
+                  '// EonApi::RemoveSession disabled for local Wine host'
+              )
+
+              Write-Host "SessionName issue patched"
+          }
+          else {
+              Write-Host "WARNING: SessionName line not found"
+          }
+
+          # -------------------------------------------------------
+          # Forward declaration for PickUpAction
+          # Real implementation remains in Pawn.h
+          # -------------------------------------------------------
+          $marker = 'void (*ServerAttemptInteractOG)'
+
+          if (-not $content.Contains($marker)) {
+              throw "ServerAttemptInteractOG marker not found"
+          }
+
+          $declaration = @'
+          void PickUpAction(
+              UFortControllerComponent_Interaction* Comp,
+              UFortItemDefinition* C4
+          );
+
+          '@
+
+          $content = $content.Replace(
+              $marker,
+              $declaration + $marker
+          )
+
+          Set-Content -Path $file -Value $content -Encoding UTF8
+
+          Write-Host "=== misc.h patched ==="
+
+          Select-String `
+            -Path $file `
+            -Pattern "PickUpAction|RemoveSession|ServerAttemptInteractOG"
+
+      # =========================================================
+      # ADD WINE DIAGNOSTICS TO ERO
+      #
+      # Writes progress to:
+      #
+      # /home/flopinou/Games/OGFN/tools/ero-host/ero-debug.log
+      #
+      # This lets us locate the exact null pointer / hook that
+      # causes the Wine crash.
+      # =========================================================
       - name: Add Ero Wine diagnostics
         shell: powershell
         run: |
@@ -5,18 +135,15 @@
           $content = Get-Content $file -Raw
 
           # -------------------------------------------------------
-          # Debug logger -> directly visible from Fedora
+          # Add debug logger
           # -------------------------------------------------------
+          $pragma = '#pragma comment(lib, "minhook/minhook.lib")'
 
-          if (-not $content.Contains("static void EroDbg(")) {
+          if (-not $content.Contains($pragma)) {
+              throw "MinHook pragma not found"
+          }
 
-              $needle = '#pragma comment(lib, "minhook/minhook.lib")'
-
-              if (-not $content.Contains($needle)) {
-                  throw "MinHook pragma not found"
-              }
-
-              $helper = @'
+          $logger = @'
 
           static void EroDbg(const char* msg)
           {
@@ -38,47 +165,74 @@
 
           '@
 
-              $content = $content.Replace(
-                  $needle,
-                  $needle + $helper
-              )
+          $content = $content.Replace(
+              $pragma,
+              $pragma + $logger
+          )
+
+          # -------------------------------------------------------
+          # InitThread start
+          # -------------------------------------------------------
+          $old = '    AllocConsole();'
+
+          if (-not $content.Contains($old)) {
+              throw "AllocConsole not found"
           }
 
-          # -------------------------------------------------------
-          # Start of InitThread
-          # -------------------------------------------------------
+          $new = @'
+              EroDbg("01 InitThread entered");
+              AllocConsole();
+          '@
 
-          $content = $content.Replace(
-              '    AllocConsole();',
-              '    EroDbg("01 InitThread entered");' + "`r`n" +
-              '    AllocConsole();'
-          )
-
-          $content = $content.Replace(
-              '    MH_Initialize();',
-              '    EroDbg("02 before MH_Initialize");' + "`r`n" +
-              '    MH_Initialize();' + "`r`n" +
-              '    EroDbg("03 after MH_Initialize");'
-          )
-
-          $content = $content.Replace(
-              '    InitGObjects();',
-              '    EroDbg("04 before InitGObjects");' + "`r`n" +
-              '    InitGObjects();' + "`r`n" +
-              '    EroDbg("05 after InitGObjects");'
-          )
+          $content = $content.Replace($old, $new)
 
           # -------------------------------------------------------
-          # Guard GetEngine() - first dangerous dereference in Ero
+          # MinHook init
           # -------------------------------------------------------
+          $old = '    MH_Initialize();'
 
-          $oldEngine = '    LPVOID GetMaxTickRateAddrOK = (LPVOID)((*(void***)GetEngine())[86]);'
-
-          if (-not $content.Contains($oldEngine)) {
-              throw "GetEngine line not found"
+          if (-not $content.Contains($old)) {
+              throw "MH_Initialize not found"
           }
 
-          $newEngine = @'
+          $new = @'
+              EroDbg("02 before MH_Initialize");
+              MH_Initialize();
+              EroDbg("03 after MH_Initialize");
+          '@
+
+          $content = $content.Replace($old, $new)
+
+          # -------------------------------------------------------
+          # GObjects init
+          # -------------------------------------------------------
+          $old = '    InitGObjects();'
+
+          if (-not $content.Contains($old)) {
+              throw "InitGObjects not found"
+          }
+
+          $new = @'
+              EroDbg("04 before InitGObjects");
+              InitGObjects();
+              EroDbg("05 after InitGObjects");
+          '@
+
+          $content = $content.Replace($old, $new)
+
+          # -------------------------------------------------------
+          # Protect first GetEngine() dereference
+          #
+          # Original:
+          # (*(void***)GetEngine())[86]
+          # -------------------------------------------------------
+          $old = '    LPVOID GetMaxTickRateAddrOK = (LPVOID)((*(void***)GetEngine())[86]);'
+
+          if (-not $content.Contains($old)) {
+              throw "GetEngine tick-rate line not found"
+          }
+
+          $new = @'
               EroDbg("06 before GetEngine");
 
               auto EngineForTickRate = GetEngine();
@@ -95,36 +249,33 @@
 
               if (!EngineVTable)
               {
-                  EroDbg("FAIL: Engine VTable is NULL");
+                  EroDbg("FAIL: Engine VTable NULL");
                   return 0;
               }
 
               EroDbg("08 Engine VTable OK");
 
-              LPVOID GetMaxTickRateAddrOK = (LPVOID)EngineVTable[86];
+              LPVOID GetMaxTickRateAddrOK =
+                  (LPVOID)EngineVTable[86];
           '@
 
-          $content = $content.Replace(
-              $oldEngine,
-              $newEngine
-          )
+          $content = $content.Replace($old, $new)
 
           # -------------------------------------------------------
-          # Guard Athena PlayerController default object
+          # Protect Athena PlayerController DefaultObject
           # -------------------------------------------------------
-
           $oldReady = '    LPVOID ServerReadyToStartMatchAddr = (LPVOID)((*(void***)AAthena_PlayerController_C::StaticClass()->DefaultObject)[0x269]);'
           $oldLoading = '    LPVOID ServerLoadingScreenDroppedAddr = (LPVOID)((*(void***)AAthena_PlayerController_C::StaticClass()->DefaultObject)[0x26B]);'
 
           if (-not $content.Contains($oldReady)) {
-              throw "ServerReadyToStartMatch line not found"
+              throw "ServerReadyToStartMatchAddr line not found"
           }
 
           if (-not $content.Contains($oldLoading)) {
-              throw "ServerLoadingScreenDropped line not found"
+              throw "ServerLoadingScreenDroppedAddr line not found"
           }
 
-          $newReady = @'
+          $new = @'
               EroDbg("09 before Athena PlayerController StaticClass");
 
               auto AthenaPCClass =
@@ -132,23 +283,25 @@
 
               if (!AthenaPCClass)
               {
-                  EroDbg("FAIL: Athena PlayerController StaticClass NULL");
+                  EroDbg("FAIL: AthenaPC StaticClass NULL");
                   return 0;
               }
 
-              auto AthenaPCDefault = AthenaPCClass->DefaultObject;
+              auto AthenaPCDefault =
+                  AthenaPCClass->DefaultObject;
 
               if (!AthenaPCDefault)
               {
-                  EroDbg("FAIL: Athena PlayerController DefaultObject NULL");
+                  EroDbg("FAIL: AthenaPC DefaultObject NULL");
                   return 0;
               }
 
-              auto AthenaPCVTable = *(void***)AthenaPCDefault;
+              auto AthenaPCVTable =
+                  *(void***)AthenaPCDefault;
 
               if (!AthenaPCVTable)
               {
-                  EroDbg("FAIL: Athena PlayerController VTable NULL");
+                  EroDbg("FAIL: AthenaPC VTable NULL");
                   return 0;
               }
 
@@ -163,7 +316,7 @@
 
           $content = $content.Replace(
               $oldReady,
-              $newReady
+              $new
           )
 
           $content = $content.Replace(
@@ -172,15 +325,22 @@
           )
 
           # -------------------------------------------------------
-          # Guard initial PlayerPawn swaps
+          # Protect initial PlayerPawn hooks
           # -------------------------------------------------------
+          $pawn1 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1EA, ServerHandlePickup, (void**)&ServerHandlePickupOG);'
+          $pawn2 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1E6, ServerHandlePickupWithSwap);'
+          $pawn3 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1E8, ServerHandlePickupWithSwap);'
 
-          $oldPawn1 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1EA, ServerHandlePickup, (void**)&ServerHandlePickupOG);'
-          $oldPawn2 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1E6, ServerHandlePickupWithSwap);'
-          $oldPawn3 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1E8, ServerHandlePickupWithSwap);'
+          if (-not $content.Contains($pawn1)) {
+              throw "PlayerPawn initial SwapVTable 1 not found"
+          }
 
-          if (-not $content.Contains($oldPawn1)) {
-              throw "Initial PlayerPawn hook not found"
+          if (-not $content.Contains($pawn2)) {
+              throw "PlayerPawn initial SwapVTable 2 not found"
+          }
+
+          if (-not $content.Contains($pawn3)) {
+              throw "PlayerPawn initial SwapVTable 3 not found"
           }
 
           $newPawn1 = @'
@@ -215,70 +375,122 @@
           '@
 
           $content = $content.Replace(
-              $oldPawn1,
+              $pawn1,
               $newPawn1
           )
 
           $content = $content.Replace(
-              $oldPawn2,
+              $pawn2,
               '    SwapVTable(PlayerPawnDefault, 0x1E6, ServerHandlePickupWithSwap);'
           )
 
           $content = $content.Replace(
-              $oldPawn3,
-              '    SwapVTable(PlayerPawnDefault, 0x1E8, ServerHandlePickupWithSwap);' +
-              "`r`n" +
-              '    EroDbg("13 initial PlayerPawn hooks OK");'
+              $pawn3,
+              @'
+              SwapVTable(PlayerPawnDefault, 0x1E8, ServerHandlePickupWithSwap);
+              EroDbg("13 initial PlayerPawn hooks OK");
+          '@
           )
 
           # -------------------------------------------------------
-          # Broad progress markers
+          # GObjects loop completed
           # -------------------------------------------------------
+          $old = '    SpecName = Conv_StringToName(TEXT("Spectating"));'
 
-          $content = $content.Replace(
-              '    SpecName = Conv_StringToName(TEXT("Spectating"));',
-              '    EroDbg("14 GObjects loops completed");' + "`r`n" +
-              '    SpecName = Conv_StringToName(TEXT("Spectating"));'
-          )
+          if (-not $content.Contains($old)) {
+              throw "SpecName marker not found"
+          }
 
-          $content = $content.Replace(
-              '    MH_CreateHook(PEAddr, ProcessEventHook, (void**)&ProcessEventOG);',
-              '    EroDbg("15 loadouts completed - starting MinHook hooks");' +
-              "`r`n" +
-              '    MH_CreateHook(PEAddr, ProcessEventHook, (void**)&ProcessEventOG);'
-          )
+          $new = @'
+              EroDbg("14 GObjects loops completed");
+              SpecName = Conv_StringToName(TEXT("Spectating"));
+          '@
 
-          $content = $content.Replace(
-              '    cout << BaseAddr << endl;',
-              '    EroDbg("16 first MinHook block completed");' + "`r`n" +
-              '    cout << BaseAddr << endl;'
-          )
-
-          $content = $content.Replace(
-              '    UFortAbilitySystemComponentAthena* DefObj =',
-              '    EroDbg("17 late VTable/MinHook block completed");' +
-              "`r`n" +
-              '    UFortAbilitySystemComponentAthena* DefObj ='
-          )
-
-          $content = $content.Replace(
-              '    ((UGameplayStatics*)UGameplayStatics::StaticClass()->DefaultObject)->OpenLevel',
-              '    EroDbg("18 ability hooks completed - before OpenLevel");' +
-              "`r`n" +
-              '    ((UGameplayStatics*)UGameplayStatics::StaticClass()->DefaultObject)->OpenLevel'
-          )
+          $content = $content.Replace($old, $new)
 
           # -------------------------------------------------------
-          # Protect final GetEngine() too
+          # Start of first major MinHook block
           # -------------------------------------------------------
+          $old = '    MH_CreateHook(PEAddr, ProcessEventHook, (void**)&ProcessEventOG);'
 
-          $oldFinal = '    GetEngine()->GameInstance->LocalPlayers.FreeArray();'
+          if (-not $content.Contains($old)) {
+              throw "ProcessEvent hook marker not found"
+          }
 
-          if ($content.Contains($oldFinal)) {
+          $new = @'
+              EroDbg("15 loadouts completed - starting MinHook hooks");
+              MH_CreateHook(PEAddr, ProcessEventHook, (void**)&ProcessEventOG);
+          '@
 
-              $newFinal = @'
-              EroDbg("19 OpenLevel completed");
+          $content = $content.Replace($old, $new)
 
+          # -------------------------------------------------------
+          # First hook block completed
+          # -------------------------------------------------------
+          $old = '    cout << BaseAddr << endl;'
+
+          if (-not $content.Contains($old)) {
+              throw "BaseAddr cout marker not found"
+          }
+
+          $new = @'
+              EroDbg("16 first MinHook block completed");
+              cout << BaseAddr << endl;
+          '@
+
+          $content = $content.Replace($old, $new)
+
+          # -------------------------------------------------------
+          # Ability-system section
+          # -------------------------------------------------------
+          $old = '    UFortAbilitySystemComponentAthena* DefObj = (UFortAbilitySystemComponentAthena*)UFortAbilitySystemComponentAthena::StaticClass()->DefaultObject;'
+
+          if (-not $content.Contains($old)) {
+              throw "AbilitySystem marker not found"
+          }
+
+          $new = @'
+              EroDbg("17 late VTable/MinHook block completed");
+              UFortAbilitySystemComponentAthena* DefObj = (UFortAbilitySystemComponentAthena*)UFortAbilitySystemComponentAthena::StaticClass()->DefaultObject;
+          '@
+
+          $content = $content.Replace($old, $new)
+
+          # -------------------------------------------------------
+          # Before OpenLevel
+          # -------------------------------------------------------
+          $old = '    ((UGameplayStatics*)UGameplayStatics::StaticClass()->DefaultObject)->OpenLevel(GetWorld(), ((UKismetStringLibrary*)UKismetStringLibrary::StaticClass()->DefaultObject)->Conv_StringToName(TEXT("Apollo_Terrain")), false, FString());'
+
+          if (-not $content.Contains($old)) {
+              throw "OpenLevel line not found"
+          }
+
+          $new = @'
+              EroDbg("18 ability hooks completed - before OpenLevel");
+
+              ((UGameplayStatics*)UGameplayStatics::StaticClass()->DefaultObject)->OpenLevel(
+                  GetWorld(),
+                  ((UKismetStringLibrary*)UKismetStringLibrary::StaticClass()->DefaultObject)
+                      ->Conv_StringToName(TEXT("Apollo_Terrain")),
+                  false,
+                  FString()
+              );
+
+              EroDbg("19 OpenLevel returned");
+          '@
+
+          $content = $content.Replace($old, $new)
+
+          # -------------------------------------------------------
+          # Protect final GetEngine()
+          # -------------------------------------------------------
+          $old = '    GetEngine()->GameInstance->LocalPlayers.FreeArray();'
+
+          if (-not $content.Contains($old)) {
+              throw "Final GetEngine line not found"
+          }
+
+          $new = @'
               auto FinalEngine = GetEngine();
 
               if (!FinalEngine)
@@ -298,16 +510,108 @@
               EroDbg("20 Ero initialization completed");
           '@
 
-              $content = $content.Replace(
-                  $oldFinal,
-                  $newFinal
-              )
-          }
+          $content = $content.Replace($old, $new)
 
+          # -------------------------------------------------------
+          # Save
+          # -------------------------------------------------------
           Set-Content -Path $file -Value $content -Encoding UTF8
 
-          Write-Host "=== Ero diagnostic patch installed ==="
+          Write-Host ""
+          Write-Host "=== Diagnostic markers installed ==="
 
           Select-String `
             -Path $file `
             -Pattern 'EroDbg|FAIL:'
+
+      # =========================================================
+      # SHOW IMPORTANT PATCHED SECTION
+      # =========================================================
+      - name: Show patched InitThread
+        shell: powershell
+        run: |
+          $file = "Ero gameserver/dllmain.cpp"
+          $lines = Get-Content $file
+
+          for ($i = 15; $i -lt [Math]::Min(150, $lines.Count); $i++) {
+              Write-Host "$($i + 1): $($lines[$i])"
+          }
+
+      # =========================================================
+      # MSBUILD
+      # =========================================================
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Show compiler version
+        shell: cmd
+        run: |
+          msbuild -version
+          where msbuild
+
+      # =========================================================
+      # BUILD
+      # =========================================================
+      - name: Build Ero
+        shell: powershell
+        run: |
+          msbuild "Ero gameserver.sln" `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PlatformToolset=v143 `
+            /fl `
+            /flp:"logfile=msbuild.log;verbosity=normal"
+
+      # =========================================================
+      # SHOW ERRORS IF BUILD FAILS
+      # =========================================================
+      - name: Show MSBuild errors
+        if: failure()
+        shell: powershell
+        run: |
+          if (Test-Path "msbuild.log") {
+              Select-String `
+                -Path "msbuild.log" `
+                -Pattern `
+                  'error C[0-9]+|fatal error|error LNK[0-9]+|error MSB[0-9]+' |
+                Select-Object -Last 100
+          }
+
+      # =========================================================
+      # FIND OUTPUT
+      # =========================================================
+      - name: Find generated DLLs
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "=== Generated DLLs ==="
+
+          Get-ChildItem -Recurse -Filter "*.dll" |
+            ForEach-Object {
+              Write-Host $_.FullName
+            }
+
+      # =========================================================
+      # UPLOAD DLL
+      # =========================================================
+      - name: Upload Ero DLL
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ero-12.41-Wine-Diagnostics
+          path: |
+            **/x64/Release/*.dll
+            **/Release/*.dll
+          if-no-files-found: error
+
+      # =========================================================
+      # UPLOAD MSBUILD LOG
+      # =========================================================
+      - name: Upload MSBuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ero-MSBuild-Log
+          path: msbuild.log
+          if-no-files-found: ignore
