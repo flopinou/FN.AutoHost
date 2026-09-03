@@ -11,46 +11,102 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ---------------------------------------------------------
+      # PATCH PROGRAM.CS
+      # - Ignore le système Settings.Default qui bloque sous Wine
+      # - Utilise directement notre chemin Fortnite 12.41
+      # ---------------------------------------------------------
       - name: Patch Program.cs for Wine
         shell: powershell
         run: |
           $file = "FN.AutoHost/Program.cs"
           $content = Get-Content $file -Raw
 
-          if (-not $content.Contains('if (!Settings.Default.first)')) {
-              throw "first-time check not found"
+          $oldFirst = 'if (!Settings.Default.first)'
+          $oldLaunch = 'Fortnite.Launch(Settings.Default.path);'
+
+          if (-not $content.Contains($oldFirst)) {
+              throw "Could not find first-run check in Program.cs"
           }
 
-          if (-not $content.Contains('Fortnite.Launch(Settings.Default.path);')) {
-              throw "Fortnite.Launch line not found"
+          if (-not $content.Contains($oldLaunch)) {
+              throw "Could not find Fortnite.Launch in Program.cs"
           }
 
           $content = $content.Replace(
-              'if (!Settings.Default.first)',
+              $oldFirst,
               'if (false)'
           )
 
           $content = $content.Replace(
-              'Fortnite.Launch(Settings.Default.path);',
+              $oldLaunch,
               'Fortnite.Launch(@"Z:\home\flopinou\Games\OGFN\builds\12.41");'
           )
 
-          Set-Content $file $content -Encoding UTF8
+          Set-Content -Path $file -Value $content -Encoding UTF8
 
+          Write-Host "=== Program.cs patched ==="
+          Select-String `
+            -Path $file `
+            -Pattern 'if \(false\)|Fortnite\.Launch'
+
+      # ---------------------------------------------------------
+      # PATCH FORTNITE.CS
+      #
+      # Original:
+      #   proc.Start()
+      #   -> inject Cobalt/Redirect
+      #   -> wait stdout "Region "
+      #   -> inject Gameserver
+      #
+      # Wine version:
+      #   proc.Start()
+      #   -> inject Tellurium immediately
+      #   -> wait 120 seconds
+      #   -> inject Ero
+      #
+      # This avoids Cobalt entirely.
+      # ---------------------------------------------------------
       - name: Patch Fortnite.cs for Tellurium
         shell: powershell
         run: |
           $file = "FN.AutoHost/Fortnite.cs"
           $content = Get-Content $file -Raw
 
-          $start = @'
-                  proc.Start();
-                  Inject(proc.Id, Directory.GetCurrentDirectory() + "\\Redirect.dll");
+          $startMarker = 'proc.Start();'
+          $endMarker = '// Interval for Checking if FortniteClient-Win64-Shipping Closed.'
 
-                  // Interval for Checking if FortniteClient-Win64-Shipping Closed.
+          $startPos = $content.IndexOf($startMarker)
 
-                  string[] LoginFailureErrs =
-          '@
+          if ($startPos -lt 0) {
+              throw "proc.Start() not found in Fortnite.cs"
+          }
+
+          $endPos = $content.IndexOf($endMarker, $startPos)
+
+          if ($endPos -lt 0) {
+              throw "Interval marker not found in Fortnite.cs"
+          }
+
+          # Start from beginning of proc.Start() line
+          $lineStart = $content.LastIndexOf("`n", $startPos)
+
+          if ($lineStart -lt 0) {
+              $lineStart = 0
+          }
+          else {
+              $lineStart++
+          }
+
+          # Start from beginning of marker line
+          $markerLineStart = $content.LastIndexOf("`n", $endPos)
+
+          if ($markerLineStart -lt 0) {
+              $markerLineStart = $endPos
+          }
+          else {
+              $markerLineStart++
+          }
 
           $replacement = @'
                   proc.Start();
@@ -58,29 +114,46 @@ jobs:
                   Console.ForegroundColor = ConsoleColor.Cyan;
                   Console.WriteLine("[+] Fortnite started, PID: " + proc.Id);
 
-                  Console.WriteLine("[+] Waiting 10 seconds before injecting Tellurium...");
-                  Thread.Sleep(10000);
+                  // Tellurium replaces Cobalt.
+                  // It needs to be injected early so it can redirect Epic requests.
+                  Console.WriteLine("[+] Injecting Redirect.dll (Tellurium)...");
 
-                  if (proc.HasExited)
+                  Inject(
+                      proc.Id,
+                      Directory.GetCurrentDirectory() + "\\Redirect.dll"
+                  );
+
+                  Console.ForegroundColor = ConsoleColor.Yellow;
+                  Console.WriteLine("[+] Tellurium injected");
+
+                  // Cobalt normally tells AutoHost when login reaches "Region".
+                  // Tellurium does not expose that stdout message, so wait for
+                  // Fortnite + backend initialization before loading Ero.
+                  Console.WriteLine("[+] Waiting 120 seconds before Gameserver injection...");
+
+                  for (int waitSecond = 1; waitSecond <= 120; waitSecond++)
                   {
-                      Console.WriteLine("[!] Fortnite exited before Redirect injection");
-                      goto start;
+                      Thread.Sleep(1000);
+
+                      if (proc.HasExited)
+                      {
+                          Console.ForegroundColor = ConsoleColor.Red;
+                          Console.WriteLine("[!] Fortnite exited BEFORE Gameserver injection");
+                          goto start;
+                      }
+
+                      if (waitSecond % 10 == 0)
+                      {
+                          Console.ForegroundColor = ConsoleColor.DarkGray;
+                          Console.WriteLine("[+] Waiting... " + waitSecond + "/120 sec");
+                      }
                   }
 
-                  Console.WriteLine("[+] Injecting Redirect.dll (Tellurium)");
-                  Inject(proc.Id, Directory.GetCurrentDirectory() + "\\Redirect.dll");
-
-                  Console.WriteLine("[+] Waiting 60 seconds for Fortnite/backend login...");
-                  Thread.Sleep(60000);
-
-                  if (proc.HasExited)
-                  {
-                      Console.WriteLine("[!] Fortnite exited after Redirect injection");
-                      goto start;
-                  }
-
-                  Console.WriteLine("[+] Injecting Gameserver DLL: " +
-                      data["Settings"]["GameServerDllName"]);
+                  Console.ForegroundColor = ConsoleColor.Cyan;
+                  Console.WriteLine(
+                      "[+] Injecting Gameserver DLL: " +
+                      data["Settings"]["GameServerDllName"]
+                  );
 
                   Inject(
                       proc.Id,
@@ -91,33 +164,79 @@ jobs:
 
                   bGameserver = true;
 
+                  Console.ForegroundColor = ConsoleColor.Green;
                   Console.WriteLine("[+] Gameserver DLL injected");
 
-                  // We no longer depend on Cobalt stdout/Region detection.
-                  while (!proc.HasExited)
-                  {
-                      Thread.Sleep(1000);
-                  }
-
-                  Console.WriteLine("[!] Fortnite exited - restarting server");
-                  goto start;
-
-                  string[] LoginFailureErrs =
           '@
 
-          if (-not $content.Contains($start)) {
-              throw "Expected Fortnite.cs block not found"
+          $before = $content.Substring(0, $lineStart)
+          $after = $content.Substring($markerLineStart)
+
+          $content = $before + $replacement + $after
+
+          # Disable the ORIGINAL Cobalt Region-triggered injection.
+          # Otherwise Ero would be injected twice if stdout happens
+          # to contain a Region line.
+          $oldRegion = 'if (output.Contains("Region "))'
+          $newRegion = 'if (false && output.Contains("Region "))'
+
+          if (-not $content.Contains($oldRegion)) {
+              throw "Original Region check not found"
           }
 
-          $content = $content.Replace($start, $replacement)
+          $content = $content.Replace(
+              $oldRegion,
+              $newRegion
+          )
 
-          Set-Content $file $content -Encoding UTF8
+          # Reset state whenever AutoHost restarts Fortnite.
+          $oldStart = @'
+              start:
+          '@
 
-          Write-Host "=== Patched Fortnite.cs ==="
+          $newStart = @'
+              start:
+                  bGameserver = false;
+          '@
+
+          if (-not $content.Contains($oldStart)) {
+              Write-Host "WARNING: start label formatting differs; continuing without reset patch"
+          }
+          else {
+              $content = $content.Replace(
+                  $oldStart,
+                  $newStart
+              )
+          }
+
+          Set-Content -Path $file -Value $content -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "=== Fortnite.cs patched ==="
+
           Select-String `
             -Path $file `
-            -Pattern "Tellurium|60 seconds|Gameserver DLL injected"
+            -Pattern `
+              'Tellurium|Waiting 120|Gameserver DLL injected|false && output.Contains|bGameserver = false'
 
+      # ---------------------------------------------------------
+      # SHOW PATCHED CODE
+      # Helpful if the build fails again.
+      # ---------------------------------------------------------
+      - name: Show patched Fortnite section
+        shell: powershell
+        run: |
+          $file = "FN.AutoHost/Fortnite.cs"
+
+          $lines = Get-Content $file
+
+          for ($i = 80; $i -lt [Math]::Min(170, $lines.Count); $i++) {
+              Write-Host "$($i + 1): $($lines[$i])"
+          }
+
+      # ---------------------------------------------------------
+      # BUILD
+      # ---------------------------------------------------------
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
 
@@ -128,11 +247,23 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Release
-        run: msbuild FN.AutoHost.sln /m /p:Configuration=Release
+        run: |
+          msbuild FN.AutoHost.sln /m /p:Configuration=Release
 
-      - name: Upload patched AutoHost
+      # ---------------------------------------------------------
+      # UPLOAD
+      # ---------------------------------------------------------
+      - name: Find build output
+        shell: powershell
+        run: |
+          Write-Host "=== Release files ==="
+          Get-ChildItem "FN.AutoHost/bin/Release" -Recurse |
+            Select-Object FullName, Length
+
+      - name: Upload FN.AutoHost
         uses: actions/upload-artifact@v4
         with:
           name: FN-AutoHost-Wine-Tellurium
           path: |
             FN.AutoHost/bin/Release/*
+          if-no-files-found: error
