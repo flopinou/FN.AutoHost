@@ -1,0 +1,72 @@
+name: Build FN.AutoHost Wine Patched
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch FN.AutoHost for Wine
+        shell: powershell
+        run: |
+          $file = "FN.AutoHost/Program.cs"
+          $content = Get-Content $file -Raw
+
+          $oldCheck = 'if (!Settings.Default.first)'
+          $oldLaunch = 'Fortnite.Launch(Settings.Default.path);'
+
+          if (-not $content.Contains($oldCheck)) {
+              throw "first-time check not found"
+          }
+
+          if (-not $content.Contains($oldLaunch)) {
+              throw "Fortnite.Launch line not found"
+          }
+
+          # Completely skip the first-run Settings system.
+          $content = $content.Replace(
+              $oldCheck,
+              'if (false)'
+          )
+
+          # Hardcode the Wine-visible Fortnite 12.41 path.
+          $content = $content.Replace(
+              $oldLaunch,
+              'Fortnite.Launch(@"Z:\home\flopinou\Games\OGFN\builds\12.41");'
+          )
+
+          Set-Content -Path $file -Value $content -Encoding UTF8
+
+          Write-Host "=== Patched lines ==="
+          Select-String `
+            -Path $file `
+            -Pattern 'if \(false\)|Fortnite\.Launch'
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore packages
+        run: nuget restore FN.AutoHost.sln
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release
+        run: msbuild FN.AutoHost.sln /m /p:Configuration=Release
+
+      - name: Show output
+        shell: powershell
+        run: |
+          Get-ChildItem "FN.AutoHost/bin/Release" -Recurse
+
+      - name: Upload patched AutoHost
+        uses: actions/upload-artifact@v4
+        with:
+          name: FN-AutoHost-Wine-Patched
+          path: |
+            FN.AutoHost/bin/Release/*
