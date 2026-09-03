@@ -46,6 +46,7 @@ jobs:
           Set-Content -Path $file -Value $content -Encoding UTF8
 
           Write-Host "=== Program.cs patched ==="
+
           Select-String `
             -Path $file `
             -Pattern 'if \(false\)|Fortnite\.Launch'
@@ -62,7 +63,7 @@ jobs:
       # Wine version:
       #   proc.Start()
       #   -> inject Tellurium immediately
-      #   -> wait 120 seconds
+      #   -> wait 10 seconds
       #   -> inject Ero
       #
       # This avoids Cobalt entirely.
@@ -115,7 +116,7 @@ jobs:
                   Console.WriteLine("[+] Fortnite started, PID: " + proc.Id);
 
                   // Tellurium replaces Cobalt.
-                  // It needs to be injected early so it can redirect Epic requests.
+                  // Inject Tellurium early so Epic/backend requests are redirected.
                   Console.WriteLine("[+] Injecting Redirect.dll (Tellurium)...");
 
                   Inject(
@@ -126,27 +127,17 @@ jobs:
                   Console.ForegroundColor = ConsoleColor.Yellow;
                   Console.WriteLine("[+] Tellurium injected");
 
-                  // Cobalt normally tells AutoHost when login reaches "Region".
-                  // Tellurium does not expose that stdout message, so wait for
-                  // Fortnite + backend initialization before loading Ero.
-                  Console.WriteLine("[+] Waiting 120 seconds before Gameserver injection...");
+                  // We already confirmed that Fortnite + Tellurium are stable.
+                  // Keep a short delay to avoid injecting Ero immediately at process start.
+                  Console.WriteLine("[+] Waiting 10 seconds before Gameserver injection...");
 
-                  for (int waitSecond = 1; waitSecond <= 120; waitSecond++)
+                  Thread.Sleep(10000);
+
+                  if (proc.HasExited)
                   {
-                      Thread.Sleep(1000);
-
-                      if (proc.HasExited)
-                      {
-                          Console.ForegroundColor = ConsoleColor.Red;
-                          Console.WriteLine("[!] Fortnite exited BEFORE Gameserver injection");
-                          goto start;
-                      }
-
-                      if (waitSecond % 10 == 0)
-                      {
-                          Console.ForegroundColor = ConsoleColor.DarkGray;
-                          Console.WriteLine("[+] Waiting... " + waitSecond + "/120 sec");
-                      }
+                      Console.ForegroundColor = ConsoleColor.Red;
+                      Console.WriteLine("[!] Fortnite exited BEFORE Gameserver injection");
+                      goto start;
                   }
 
                   Console.ForegroundColor = ConsoleColor.Cyan;
@@ -175,8 +166,8 @@ jobs:
           $content = $before + $replacement + $after
 
           # Disable the ORIGINAL Cobalt Region-triggered injection.
-          # Otherwise Ero would be injected twice if stdout happens
-          # to contain a Region line.
+          # Otherwise Ero could be injected a second time if stdout
+          # happens to contain a Region line.
           $oldRegion = 'if (output.Contains("Region "))'
           $newRegion = 'if (false && output.Contains("Region "))'
 
@@ -217,7 +208,7 @@ jobs:
           Select-String `
             -Path $file `
             -Pattern `
-              'Tellurium|Waiting 120|Gameserver DLL injected|false && output.Contains|bGameserver = false'
+              'Tellurium|Waiting 10 seconds|Gameserver DLL injected|false && output.Contains|bGameserver = false'
 
       # ---------------------------------------------------------
       # SHOW PATCHED CODE
@@ -251,19 +242,23 @@ jobs:
           msbuild FN.AutoHost.sln /m /p:Configuration=Release
 
       # ---------------------------------------------------------
-      # UPLOAD
+      # SHOW OUTPUT
       # ---------------------------------------------------------
       - name: Find build output
         shell: powershell
         run: |
           Write-Host "=== Release files ==="
+
           Get-ChildItem "FN.AutoHost/bin/Release" -Recurse |
             Select-Object FullName, Length
 
+      # ---------------------------------------------------------
+      # UPLOAD
+      # ---------------------------------------------------------
       - name: Upload FN.AutoHost
         uses: actions/upload-artifact@v4
         with:
-          name: FN-AutoHost-Wine-Tellurium
+          name: FN-AutoHost-Wine-Tellurium-10s
           path: |
             FN.AutoHost/bin/Release/*
           if-no-files-found: error
