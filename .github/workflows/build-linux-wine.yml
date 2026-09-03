@@ -1,269 +1,313 @@
-name: Build FN.AutoHost Wine Tellurium
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-2022
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ---------------------------------------------------------
-      # PATCH PROGRAM.CS
-      # - Ignore le système Settings.Default qui bloque sous Wine
-      # - Utilise directement notre chemin Fortnite 12.41
-      # ---------------------------------------------------------
-      - name: Patch Program.cs for Wine
+      - name: Add Ero Wine diagnostics
         shell: powershell
         run: |
-          $file = "FN.AutoHost/Program.cs"
+          $file = "Ero gameserver/dllmain.cpp"
           $content = Get-Content $file -Raw
 
-          $oldFirst = 'if (!Settings.Default.first)'
-          $oldLaunch = 'Fortnite.Launch(Settings.Default.path);'
+          # -------------------------------------------------------
+          # Debug logger -> directly visible from Fedora
+          # -------------------------------------------------------
 
-          if (-not $content.Contains($oldFirst)) {
-              throw "Could not find first-run check in Program.cs"
+          if (-not $content.Contains("static void EroDbg(")) {
+
+              $needle = '#pragma comment(lib, "minhook/minhook.lib")'
+
+              if (-not $content.Contains($needle)) {
+                  throw "MinHook pragma not found"
+              }
+
+              $helper = @'
+
+          static void EroDbg(const char* msg)
+          {
+              FILE* f = nullptr;
+
+              fopen_s(
+                  &f,
+                  R"(Z:\home\flopinou\Games\OGFN\tools\ero-host\ero-debug.log)",
+                  "a"
+              );
+
+              if (f)
+              {
+                  fprintf(f, "%s\n", msg);
+                  fflush(f);
+                  fclose(f);
+              }
           }
-
-          if (-not $content.Contains($oldLaunch)) {
-              throw "Could not find Fortnite.Launch in Program.cs"
-          }
-
-          $content = $content.Replace(
-              $oldFirst,
-              'if (false)'
-          )
-
-          $content = $content.Replace(
-              $oldLaunch,
-              'Fortnite.Launch(@"Z:\home\flopinou\Games\OGFN\builds\12.41");'
-          )
-
-          Set-Content -Path $file -Value $content -Encoding UTF8
-
-          Write-Host "=== Program.cs patched ==="
-          Select-String `
-            -Path $file `
-            -Pattern 'if \(false\)|Fortnite\.Launch'
-
-      # ---------------------------------------------------------
-      # PATCH FORTNITE.CS
-      #
-      # Original:
-      #   proc.Start()
-      #   -> inject Cobalt/Redirect
-      #   -> wait stdout "Region "
-      #   -> inject Gameserver
-      #
-      # Wine version:
-      #   proc.Start()
-      #   -> inject Tellurium immediately
-      #   -> wait 120 seconds
-      #   -> inject Ero
-      #
-      # This avoids Cobalt entirely.
-      # ---------------------------------------------------------
-      - name: Patch Fortnite.cs for Tellurium
-        shell: powershell
-        run: |
-          $file = "FN.AutoHost/Fortnite.cs"
-          $content = Get-Content $file -Raw
-
-          $startMarker = 'proc.Start();'
-          $endMarker = '// Interval for Checking if FortniteClient-Win64-Shipping Closed.'
-
-          $startPos = $content.IndexOf($startMarker)
-
-          if ($startPos -lt 0) {
-              throw "proc.Start() not found in Fortnite.cs"
-          }
-
-          $endPos = $content.IndexOf($endMarker, $startPos)
-
-          if ($endPos -lt 0) {
-              throw "Interval marker not found in Fortnite.cs"
-          }
-
-          # Start from beginning of proc.Start() line
-          $lineStart = $content.LastIndexOf("`n", $startPos)
-
-          if ($lineStart -lt 0) {
-              $lineStart = 0
-          }
-          else {
-              $lineStart++
-          }
-
-          # Start from beginning of marker line
-          $markerLineStart = $content.LastIndexOf("`n", $endPos)
-
-          if ($markerLineStart -lt 0) {
-              $markerLineStart = $endPos
-          }
-          else {
-              $markerLineStart++
-          }
-
-          $replacement = @'
-                  proc.Start();
-
-                  Console.ForegroundColor = ConsoleColor.Cyan;
-                  Console.WriteLine("[+] Fortnite started, PID: " + proc.Id);
-
-                  // Tellurium replaces Cobalt.
-                  // It needs to be injected early so it can redirect Epic requests.
-                  Console.WriteLine("[+] Injecting Redirect.dll (Tellurium)...");
-
-                  Inject(
-                      proc.Id,
-                      Directory.GetCurrentDirectory() + "\\Redirect.dll"
-                  );
-
-                  Console.ForegroundColor = ConsoleColor.Yellow;
-                  Console.WriteLine("[+] Tellurium injected");
-
-                  // Cobalt normally tells AutoHost when login reaches "Region".
-                  // Tellurium does not expose that stdout message, so wait for
-                  // Fortnite + backend initialization before loading Ero.
-                  Console.WriteLine("[+] Waiting 120 seconds before Gameserver injection...");
-
-                  for (int waitSecond = 1; waitSecond <= 120; waitSecond++)
-                  {
-                      Thread.Sleep(1000);
-
-                      if (proc.HasExited)
-                      {
-                          Console.ForegroundColor = ConsoleColor.Red;
-                          Console.WriteLine("[!] Fortnite exited BEFORE Gameserver injection");
-                          goto start;
-                      }
-
-                      if (waitSecond % 10 == 0)
-                      {
-                          Console.ForegroundColor = ConsoleColor.DarkGray;
-                          Console.WriteLine("[+] Waiting... " + waitSecond + "/120 sec");
-                      }
-                  }
-
-                  Console.ForegroundColor = ConsoleColor.Cyan;
-                  Console.WriteLine(
-                      "[+] Injecting Gameserver DLL: " +
-                      data["Settings"]["GameServerDllName"]
-                  );
-
-                  Inject(
-                      proc.Id,
-                      Directory.GetCurrentDirectory() +
-                      "\\" +
-                      data["Settings"]["GameServerDllName"]
-                  );
-
-                  bGameserver = true;
-
-                  Console.ForegroundColor = ConsoleColor.Green;
-                  Console.WriteLine("[+] Gameserver DLL injected");
 
           '@
 
-          $before = $content.Substring(0, $lineStart)
-          $after = $content.Substring($markerLineStart)
-
-          $content = $before + $replacement + $after
-
-          # Disable the ORIGINAL Cobalt Region-triggered injection.
-          # Otherwise Ero would be injected twice if stdout happens
-          # to contain a Region line.
-          $oldRegion = 'if (output.Contains("Region "))'
-          $newRegion = 'if (false && output.Contains("Region "))'
-
-          if (-not $content.Contains($oldRegion)) {
-              throw "Original Region check not found"
-          }
-
-          $content = $content.Replace(
-              $oldRegion,
-              $newRegion
-          )
-
-          # Reset state whenever AutoHost restarts Fortnite.
-          $oldStart = @'
-              start:
-          '@
-
-          $newStart = @'
-              start:
-                  bGameserver = false;
-          '@
-
-          if (-not $content.Contains($oldStart)) {
-              Write-Host "WARNING: start label formatting differs; continuing without reset patch"
-          }
-          else {
               $content = $content.Replace(
-                  $oldStart,
-                  $newStart
+                  $needle,
+                  $needle + $helper
+              )
+          }
+
+          # -------------------------------------------------------
+          # Start of InitThread
+          # -------------------------------------------------------
+
+          $content = $content.Replace(
+              '    AllocConsole();',
+              '    EroDbg("01 InitThread entered");' + "`r`n" +
+              '    AllocConsole();'
+          )
+
+          $content = $content.Replace(
+              '    MH_Initialize();',
+              '    EroDbg("02 before MH_Initialize");' + "`r`n" +
+              '    MH_Initialize();' + "`r`n" +
+              '    EroDbg("03 after MH_Initialize");'
+          )
+
+          $content = $content.Replace(
+              '    InitGObjects();',
+              '    EroDbg("04 before InitGObjects");' + "`r`n" +
+              '    InitGObjects();' + "`r`n" +
+              '    EroDbg("05 after InitGObjects");'
+          )
+
+          # -------------------------------------------------------
+          # Guard GetEngine() - first dangerous dereference in Ero
+          # -------------------------------------------------------
+
+          $oldEngine = '    LPVOID GetMaxTickRateAddrOK = (LPVOID)((*(void***)GetEngine())[86]);'
+
+          if (-not $content.Contains($oldEngine)) {
+              throw "GetEngine line not found"
+          }
+
+          $newEngine = @'
+              EroDbg("06 before GetEngine");
+
+              auto EngineForTickRate = GetEngine();
+
+              if (!EngineForTickRate)
+              {
+                  EroDbg("FAIL: GetEngine returned NULL");
+                  return 0;
+              }
+
+              EroDbg("07 GetEngine OK");
+
+              auto EngineVTable = *(void***)EngineForTickRate;
+
+              if (!EngineVTable)
+              {
+                  EroDbg("FAIL: Engine VTable is NULL");
+                  return 0;
+              }
+
+              EroDbg("08 Engine VTable OK");
+
+              LPVOID GetMaxTickRateAddrOK = (LPVOID)EngineVTable[86];
+          '@
+
+          $content = $content.Replace(
+              $oldEngine,
+              $newEngine
+          )
+
+          # -------------------------------------------------------
+          # Guard Athena PlayerController default object
+          # -------------------------------------------------------
+
+          $oldReady = '    LPVOID ServerReadyToStartMatchAddr = (LPVOID)((*(void***)AAthena_PlayerController_C::StaticClass()->DefaultObject)[0x269]);'
+          $oldLoading = '    LPVOID ServerLoadingScreenDroppedAddr = (LPVOID)((*(void***)AAthena_PlayerController_C::StaticClass()->DefaultObject)[0x26B]);'
+
+          if (-not $content.Contains($oldReady)) {
+              throw "ServerReadyToStartMatch line not found"
+          }
+
+          if (-not $content.Contains($oldLoading)) {
+              throw "ServerLoadingScreenDropped line not found"
+          }
+
+          $newReady = @'
+              EroDbg("09 before Athena PlayerController StaticClass");
+
+              auto AthenaPCClass =
+                  AAthena_PlayerController_C::StaticClass();
+
+              if (!AthenaPCClass)
+              {
+                  EroDbg("FAIL: Athena PlayerController StaticClass NULL");
+                  return 0;
+              }
+
+              auto AthenaPCDefault = AthenaPCClass->DefaultObject;
+
+              if (!AthenaPCDefault)
+              {
+                  EroDbg("FAIL: Athena PlayerController DefaultObject NULL");
+                  return 0;
+              }
+
+              auto AthenaPCVTable = *(void***)AthenaPCDefault;
+
+              if (!AthenaPCVTable)
+              {
+                  EroDbg("FAIL: Athena PlayerController VTable NULL");
+                  return 0;
+              }
+
+              EroDbg("10 Athena PlayerController OK");
+
+              LPVOID ServerReadyToStartMatchAddr =
+                  (LPVOID)AthenaPCVTable[0x269];
+
+              LPVOID ServerLoadingScreenDroppedAddr =
+                  (LPVOID)AthenaPCVTable[0x26B];
+          '@
+
+          $content = $content.Replace(
+              $oldReady,
+              $newReady
+          )
+
+          $content = $content.Replace(
+              $oldLoading,
+              ''
+          )
+
+          # -------------------------------------------------------
+          # Guard initial PlayerPawn swaps
+          # -------------------------------------------------------
+
+          $oldPawn1 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1EA, ServerHandlePickup, (void**)&ServerHandlePickupOG);'
+          $oldPawn2 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1E6, ServerHandlePickupWithSwap);'
+          $oldPawn3 = '    SwapVTable(APlayerPawn_Athena_C::StaticClass()->DefaultObject, 0x1E8, ServerHandlePickupWithSwap);'
+
+          if (-not $content.Contains($oldPawn1)) {
+              throw "Initial PlayerPawn hook not found"
+          }
+
+          $newPawn1 = @'
+              EroDbg("11 before PlayerPawn StaticClass");
+
+              auto PlayerPawnClass =
+                  APlayerPawn_Athena_C::StaticClass();
+
+              if (!PlayerPawnClass)
+              {
+                  EroDbg("FAIL: PlayerPawn StaticClass NULL");
+                  return 0;
+              }
+
+              auto PlayerPawnDefault =
+                  PlayerPawnClass->DefaultObject;
+
+              if (!PlayerPawnDefault)
+              {
+                  EroDbg("FAIL: PlayerPawn DefaultObject NULL");
+                  return 0;
+              }
+
+              EroDbg("12 PlayerPawn DefaultObject OK");
+
+              SwapVTable(
+                  PlayerPawnDefault,
+                  0x1EA,
+                  ServerHandlePickup,
+                  (void**)&ServerHandlePickupOG
+              );
+          '@
+
+          $content = $content.Replace(
+              $oldPawn1,
+              $newPawn1
+          )
+
+          $content = $content.Replace(
+              $oldPawn2,
+              '    SwapVTable(PlayerPawnDefault, 0x1E6, ServerHandlePickupWithSwap);'
+          )
+
+          $content = $content.Replace(
+              $oldPawn3,
+              '    SwapVTable(PlayerPawnDefault, 0x1E8, ServerHandlePickupWithSwap);' +
+              "`r`n" +
+              '    EroDbg("13 initial PlayerPawn hooks OK");'
+          )
+
+          # -------------------------------------------------------
+          # Broad progress markers
+          # -------------------------------------------------------
+
+          $content = $content.Replace(
+              '    SpecName = Conv_StringToName(TEXT("Spectating"));',
+              '    EroDbg("14 GObjects loops completed");' + "`r`n" +
+              '    SpecName = Conv_StringToName(TEXT("Spectating"));'
+          )
+
+          $content = $content.Replace(
+              '    MH_CreateHook(PEAddr, ProcessEventHook, (void**)&ProcessEventOG);',
+              '    EroDbg("15 loadouts completed - starting MinHook hooks");' +
+              "`r`n" +
+              '    MH_CreateHook(PEAddr, ProcessEventHook, (void**)&ProcessEventOG);'
+          )
+
+          $content = $content.Replace(
+              '    cout << BaseAddr << endl;',
+              '    EroDbg("16 first MinHook block completed");' + "`r`n" +
+              '    cout << BaseAddr << endl;'
+          )
+
+          $content = $content.Replace(
+              '    UFortAbilitySystemComponentAthena* DefObj =',
+              '    EroDbg("17 late VTable/MinHook block completed");' +
+              "`r`n" +
+              '    UFortAbilitySystemComponentAthena* DefObj ='
+          )
+
+          $content = $content.Replace(
+              '    ((UGameplayStatics*)UGameplayStatics::StaticClass()->DefaultObject)->OpenLevel',
+              '    EroDbg("18 ability hooks completed - before OpenLevel");' +
+              "`r`n" +
+              '    ((UGameplayStatics*)UGameplayStatics::StaticClass()->DefaultObject)->OpenLevel'
+          )
+
+          # -------------------------------------------------------
+          # Protect final GetEngine() too
+          # -------------------------------------------------------
+
+          $oldFinal = '    GetEngine()->GameInstance->LocalPlayers.FreeArray();'
+
+          if ($content.Contains($oldFinal)) {
+
+              $newFinal = @'
+              EroDbg("19 OpenLevel completed");
+
+              auto FinalEngine = GetEngine();
+
+              if (!FinalEngine)
+              {
+                  EroDbg("FAIL: Final GetEngine NULL");
+                  return 0;
+              }
+
+              if (!FinalEngine->GameInstance)
+              {
+                  EroDbg("FAIL: GameInstance NULL");
+                  return 0;
+              }
+
+              FinalEngine->GameInstance->LocalPlayers.FreeArray();
+
+              EroDbg("20 Ero initialization completed");
+          '@
+
+              $content = $content.Replace(
+                  $oldFinal,
+                  $newFinal
               )
           }
 
           Set-Content -Path $file -Value $content -Encoding UTF8
 
-          Write-Host ""
-          Write-Host "=== Fortnite.cs patched ==="
+          Write-Host "=== Ero diagnostic patch installed ==="
 
           Select-String `
             -Path $file `
-            -Pattern `
-              'Tellurium|Waiting 120|Gameserver DLL injected|false && output.Contains|bGameserver = false'
-
-      # ---------------------------------------------------------
-      # SHOW PATCHED CODE
-      # Helpful if the build fails again.
-      # ---------------------------------------------------------
-      - name: Show patched Fortnite section
-        shell: powershell
-        run: |
-          $file = "FN.AutoHost/Fortnite.cs"
-
-          $lines = Get-Content $file
-
-          for ($i = 80; $i -lt [Math]::Min(170, $lines.Count); $i++) {
-              Write-Host "$($i + 1): $($lines[$i])"
-          }
-
-      # ---------------------------------------------------------
-      # BUILD
-      # ---------------------------------------------------------
-      - name: Setup NuGet
-        uses: NuGet/setup-nuget@v2
-
-      - name: Restore packages
-        run: nuget restore FN.AutoHost.sln
-
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Build Release
-        run: |
-          msbuild FN.AutoHost.sln /m /p:Configuration=Release
-
-      # ---------------------------------------------------------
-      # UPLOAD
-      # ---------------------------------------------------------
-      - name: Find build output
-        shell: powershell
-        run: |
-          Write-Host "=== Release files ==="
-          Get-ChildItem "FN.AutoHost/bin/Release" -Recurse |
-            Select-Object FullName, Length
-
-      - name: Upload FN.AutoHost
-        uses: actions/upload-artifact@v4
-        with:
-          name: FN-AutoHost-Wine-Tellurium
-          path: |
-            FN.AutoHost/bin/Release/*
-          if-no-files-found: error
+            -Pattern 'EroDbg|FAIL:'
