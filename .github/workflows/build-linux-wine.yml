@@ -1,4 +1,4 @@
-name: Build FN.AutoHost Wine Patched
+name: Build FN.AutoHost Wine Tellurium
 
 on:
   workflow_dispatch:
@@ -11,41 +11,112 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Patch FN.AutoHost for Wine
+      - name: Patch Program.cs for Wine
         shell: powershell
         run: |
           $file = "FN.AutoHost/Program.cs"
           $content = Get-Content $file -Raw
 
-          $oldCheck = 'if (!Settings.Default.first)'
-          $oldLaunch = 'Fortnite.Launch(Settings.Default.path);'
-
-          if (-not $content.Contains($oldCheck)) {
+          if (-not $content.Contains('if (!Settings.Default.first)')) {
               throw "first-time check not found"
           }
 
-          if (-not $content.Contains($oldLaunch)) {
+          if (-not $content.Contains('Fortnite.Launch(Settings.Default.path);')) {
               throw "Fortnite.Launch line not found"
           }
 
-          # Completely skip the first-run Settings system.
           $content = $content.Replace(
-              $oldCheck,
+              'if (!Settings.Default.first)',
               'if (false)'
           )
 
-          # Hardcode the Wine-visible Fortnite 12.41 path.
           $content = $content.Replace(
-              $oldLaunch,
+              'Fortnite.Launch(Settings.Default.path);',
               'Fortnite.Launch(@"Z:\home\flopinou\Games\OGFN\builds\12.41");'
           )
 
-          Set-Content -Path $file -Value $content -Encoding UTF8
+          Set-Content $file $content -Encoding UTF8
 
-          Write-Host "=== Patched lines ==="
+      - name: Patch Fortnite.cs for Tellurium
+        shell: powershell
+        run: |
+          $file = "FN.AutoHost/Fortnite.cs"
+          $content = Get-Content $file -Raw
+
+          $start = @'
+                  proc.Start();
+                  Inject(proc.Id, Directory.GetCurrentDirectory() + "\\Redirect.dll");
+
+                  // Interval for Checking if FortniteClient-Win64-Shipping Closed.
+
+                  string[] LoginFailureErrs =
+          '@
+
+          $replacement = @'
+                  proc.Start();
+
+                  Console.ForegroundColor = ConsoleColor.Cyan;
+                  Console.WriteLine("[+] Fortnite started, PID: " + proc.Id);
+
+                  Console.WriteLine("[+] Waiting 10 seconds before injecting Tellurium...");
+                  Thread.Sleep(10000);
+
+                  if (proc.HasExited)
+                  {
+                      Console.WriteLine("[!] Fortnite exited before Redirect injection");
+                      goto start;
+                  }
+
+                  Console.WriteLine("[+] Injecting Redirect.dll (Tellurium)");
+                  Inject(proc.Id, Directory.GetCurrentDirectory() + "\\Redirect.dll");
+
+                  Console.WriteLine("[+] Waiting 60 seconds for Fortnite/backend login...");
+                  Thread.Sleep(60000);
+
+                  if (proc.HasExited)
+                  {
+                      Console.WriteLine("[!] Fortnite exited after Redirect injection");
+                      goto start;
+                  }
+
+                  Console.WriteLine("[+] Injecting Gameserver DLL: " +
+                      data["Settings"]["GameServerDllName"]);
+
+                  Inject(
+                      proc.Id,
+                      Directory.GetCurrentDirectory() +
+                      "\\" +
+                      data["Settings"]["GameServerDllName"]
+                  );
+
+                  bGameserver = true;
+
+                  Console.WriteLine("[+] Gameserver DLL injected");
+
+                  // We no longer depend on Cobalt stdout/Region detection.
+                  while (!proc.HasExited)
+                  {
+                      Thread.Sleep(1000);
+                  }
+
+                  Console.WriteLine("[!] Fortnite exited - restarting server");
+                  goto start;
+
+                  string[] LoginFailureErrs =
+          '@
+
+          if (-not $content.Contains($start)) {
+              throw "Expected Fortnite.cs block not found"
+          }
+
+          $content = $content.Replace($start, $replacement)
+
+          Set-Content $file $content -Encoding UTF8
+
+          Write-Host "=== Patched Fortnite.cs ==="
           Select-String `
             -Path $file `
-            -Pattern 'if \(false\)|Fortnite\.Launch'
+            -Pattern "Tellurium|60 seconds|Gameserver DLL injected"
 
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
@@ -59,14 +130,9 @@ jobs:
       - name: Build Release
         run: msbuild FN.AutoHost.sln /m /p:Configuration=Release
 
-      - name: Show output
-        shell: powershell
-        run: |
-          Get-ChildItem "FN.AutoHost/bin/Release" -Recurse
-
       - name: Upload patched AutoHost
         uses: actions/upload-artifact@v4
         with:
-          name: FN-AutoHost-Wine-Patched
+          name: FN-AutoHost-Wine-Tellurium
           path: |
             FN.AutoHost/bin/Release/*
